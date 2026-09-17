@@ -42,6 +42,30 @@ def events_path(seg_root: str, seg_id: str) -> str:
     return os.path.join(seg_dir(seg_root, seg_id), "events.log")
 
 
+def readable_events_path(seg_root: str, seg_id: str) -> Optional[str]:
+    """Path to a readable events.log for ``seg_id``.
+
+    Prefers the live directory.  During a capacity eviction's move->publish
+    window the directory has been renamed into a ``gcgrave-<job>/`` holding
+    area; its bytes are identical and immutable, so readers may safely fall
+    back to that copy instead of failing while the order commits.  Returns
+    None when neither location carries the file.
+    """
+    live = events_path(seg_root, seg_id)
+    if os.path.exists(live):
+        return live
+    try:
+        for name in os.listdir(seg_root):
+            if not name.startswith("gcgrave-"):
+                continue
+            candidate = os.path.join(seg_root, name, seg_id, "events.log")
+            if os.path.exists(candidate):
+                return candidate
+    except FileNotFoundError:
+        return None
+    return None
+
+
 def write_segment(seg_root: str, seg_id: str, records: List[dict]) -> Tuple[dict, dict]:
     """Write a sealed segment into its live directory.
 
@@ -164,18 +188,22 @@ def rebuild_index(seg_root: str, meta: dict) -> dict:
 
 
 def scan_records(seg_root: str, meta: dict, from_offset: int = 0,
-                 limit: Optional[int] = None) -> Tuple[List[dict], bool]:
+                 limit: Optional[int] = None,
+                 path: Optional[str] = None) -> Tuple[List[dict], bool]:
     """Sequentially read records with offset >= from_offset.
 
     Returns (records, complete).  complete=False means `limit` was hit and
     more records may follow.  Raises SegmentCorrupt on any frame error.
+    ``path`` overrides the default live-file location (used to read the
+    identical grave copy during an eviction move->publish window).
     """
     seg_id = meta["id"]
     resume = meta["last_offset"] + 1
     out: List[dict] = []
     complete = True
     try:
-        for _pos, payload in wal.iter_frames(events_path(seg_root, seg_id)):
+        for _pos, payload in wal.iter_frames(
+                path or events_path(seg_root, seg_id)):
             rec = json.loads(payload)
             if rec["offset"] < from_offset:
                 continue

@@ -218,6 +218,69 @@ def main():
               and stats["segments"]["sealed"] >= 3
               and stats["repairs"]["active"] == 0
               and stats["repairs"]["succeeded"] >= 2)
+
+        print("== 8. capacity eviction: preview, holds, apply, 410 ==")
+        # Pick the OLDEST sealed segment that is pinned by no snapshot: take
+        # a fresh snapshot of the current view, then choose the segment just
+        # beyond it... Instead, directly choose the oldest sealed segment and
+        # a cut strictly above its last offset; freezes from earlier steps may
+        # pin it, so first inspect references and use a later, unpinned one.
+        all_segs = req("GET", "/v1/segments")["segments"]
+        freezes = req("GET", "/v1/freezes")["freezes"]
+        pinned = {sid for f in freezes for sid in f["segments"]}
+        victim = next(m for m in all_segs if m["id"] not in pinned
+                      and m["status"] == "sealed")
+        cut = victim["last_offset"] + 1
+
+        # A pure preview must answer with the fixed shape and not apply.
+        plan = req("POST", "/v1/gc/plans", {"cut": cut})
+        check("preview returns fixed shape",
+              set(plan) == {"plan_id", "cut", "stamp", "items",
+                            "size", "created_at"}
+              and [i["seg_id"] for i in plan["items"]][:1] == [victim["id"]]
+              and plan["items"][0]["size"] >= 0,
+              f"victim={victim['id']}")
+        check("preview did not create a job",
+              req("GET", "/v1/gc/jobs")["jobs"] == [])
+
+        # A hold at the start protects everything; the same cut selects none.
+        h = req("POST", "/v1/holds",
+                {"hold_id": "smoke-hold", "pos": 0, "ttl_seconds": 600})
+        check("hold created", h["hold"]["hold_id"] == "smoke-hold")
+        guarded = req("POST", "/v1/gc/plans", {"cut": cut})
+        check("active hold excludes item", guarded["items"] == [])
+        req("DELETE", "/v1/holds/smoke-hold")
+        released = req("POST", "/v1/gc/plans", {"cut": cut})
+        check("released hold lets a new plan select",
+              any(i["seg_id"] == victim["id"] for i in released["items"]))
+
+        # First apply 202, repeat 200 with the same job id.
+        r = req("POST", f"/v1/gc/plans/{released['plan_id']}/apply")
+        gjob = r["gc_job"]
+        check("first apply accepted (202-style)", gjob["id"].startswith("gcj-"))
+        for _ in range(200):
+            j = req("GET", f"/v1/gc/jobs/{gjob['id']}")["gc_job"]
+            if j["status"] in ("succeeded", "failed"):
+                break
+            time.sleep(0.05)
+        check("gc job succeeded", j["status"] == "succeeded"
+              and j["evicted"] >= 1, str(j.get("error")))
+        again, code2 = req_status("POST",
+                                  f"/v1/gc/plans/{released['plan_id']}/apply")
+        check("repeat apply is 200 same job", code2 == 200
+              and again["gc_job"]["id"] == gjob["id"])
+        audit = req("GET", "/v1/gc/audit")["audit"]
+        check("audit records the item",
+              any(a["seg_id"] == victim["id"] for a in audit))
+
+        first, last = victim["first_offset"], victim["last_offset"]
+        body, code = req_status(
+            "GET", f"/v1/replay?from_offset={first}&limit=100")
+        check("evicted position -> 410 with accurate cursor",
+              code == 410 and body.get("cursor") == last + 1, str(body)[:120])
+        tail = req("GET", f"/v1/replay?from_offset={last + 1}&limit=100")
+        check("resume at cursor reads surviving data",
+              tail["events"][0]["offset"] == last + 1)
     finally:
         stop_server(proc)
         shutil.rmtree(data_dir, ignore_errors=True)

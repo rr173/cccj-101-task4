@@ -21,6 +21,10 @@ class Config:
     repair_max_attempts: int = 5          # version-conflict / torn-WAL retries
     repair_retry_backoff_sec: float = 0.1
     repair_history: int = 100             # finished jobs retained in the journal
+    gc_workers: int = 1                   # GC apply jobs (serialized; >=1)
+    gc_hold_default_ttl_sec: float = 900.0   # hold TTL when caller omits one
+    gc_hold_max_ttl_sec: float = 86400.0  # upper bound on a single hold TTL
+    gc_audit_history: int = 1000          # successful evictions kept in audit
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -45,4 +49,10 @@ class Config:
             repair_retry_backoff_sec=env("EA_REPAIR_RETRY_BACKOFF_SEC",
                                          cls.repair_retry_backoff_sec, float),
             repair_history=env("EA_REPAIR_HISTORY", cls.repair_history, int),
+            gc_workers=env("EA_GC_WORKERS", cls.gc_workers, int),
+            gc_hold_default_ttl_sec=env("EA_GC_HOLD_DEFAULT_TTL_SEC",
+                                        cls.gc_hold_default_ttl_sec, float),
+            gc_hold_max_ttl_sec=env("EA_GC_HOLD_MAX_TTL_SEC",
+                                    cls.gc_hold_max_ttl_sec, float),
+            gc_audit_history=env("EA_GC_AUDIT_HISTORY", cls.gc_audit_history, int),
         )

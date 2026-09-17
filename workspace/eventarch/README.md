@@ -85,6 +85,12 @@ make smoke    # 端到端：起服务→分类→冻结→重启→损坏→隔�
 | `POST /v1/freeze` | 冻结当前视图：封存开放段，返回 `{id, end_offset, segments}` |
 | `GET /v1/freezes` | 冻结列表 |
 | `GET /v1/replay?freeze_id=&from_offset=&device_id=&limit=` | 回放冻结视图（不传 `freeze_id` 则回放到当前头） |
+| `POST /v1/gc/plans` | **容量清退预演**：传 `cut`，只计算并返回 `plan_id/stamp/items/size`（不落盘） |
+| `POST /v1/gc/plans/{id}/apply` | 受理清退：首次 `202 + gc_job`，重复 `200` 同一 job；漂移则 `409` 且磁盘原样 |
+| `GET /v1/gc/jobs/{id}` · `POST /v1/gc/jobs/{id}` | 查/等待清退作业进度（POST 可带 `timeout`） |
+| `GET /v1/gc/jobs` · `GET /v1/gc/audit` | 清退作业列表 / 成功清退项的持久审计 |
+| `POST /v1/holds` | 创建或幂等续期读者保护区（`hold_id/pos/ttl_seconds`） |
+| `DELETE /v1/holds/{id}` · `GET /v1/holds` | 解除保护区 / 查看未过期保护区 |
 | `GET /v1/stats` · `GET /v1/healthz` | 运行指标 / 健康检查 |
 
 ### 冻结与回放
@@ -153,6 +159,59 @@ succeeded | failed`，每次状态迁移落盘到 `state/repairs.json`。失败�
   `succeeded` 但崩溃在“换目录与 manifest 提交之间”的作业会在候选字节校验
   通过时补提交、否则回滚，保证已确认数据不丢、段不重。
 
+## 容量清退预演与读者保护
+
+容量回收分两步：先**纯预演**（`POST /v1/gc/plans`），调用方核对 `items[]` 与
+`size` 后再 **apply**（`POST /v1/gc/plans/{id}/apply`）受理后台清退作业。
+
+- **预演只读**：`cut` 是排他高水位（段 `last_offset < cut` 才可能入选）；响应固定为
+  `{plan_id, cut, stamp, items[], size, created_at}`，不写任何文件、不改元数据总表。
+  每个 item 含 `{seg_id, first_offset, last_offset, size}`；`stamp` 是整单指纹。
+- **三类读者保护**（入选项须同时避开）：
+  1. **快照引用集合**：任一 freeze 的 `segments` 引用的段不入选；
+  2. **正在维修集合**：存在活动 repair 作业的段不入选；
+  3. **尚未过期的保护区**：hold 保护其 `pos` 所在项及**所有更大位置**
+     （即 `段.last_offset >= pos` 的段不入选）。
+- **保护区生命周期**：`POST /v1/holds` 由调用方给定 `hold_id/pos/ttl_seconds`，
+  同 `hold_id`+同 `pos` 重复调用即**幂等续期**（200，刷新 `expires_at`）；
+  同 id 改 pos 返回 409；`DELETE /v1/holds/{id}` 主动解除；到期自动失效。
+  续期/解除只影响**此后新建**的 plan——预演后保护区集合发生任何变化，旧单 apply 一律 409。
+- **乐观并发（整单 409）**：预演之后到提交之间，任一入选项的字节/版本（stamp）、
+  快照引用关系、维修态、保护集合或 cut 发生变化，apply **整单**返回 409、零清理、
+  磁盘维持原样；同一 plan 反复 apply 得到**相同结论**（成功永远是同一个 `gc_job`，
+  冲突永远是同一条 409，且重启后结论不变）。
+- **受理语义**：首次受理 `202 {"gc_job": {...}}`，重复受理 `200` 且为同一 job id；
+  `GET /v1/gc/jobs/{id}` 查进度（`queued/running/…/succeeded|failed`、`evicted/total`）。
+- **不拖慢前台**：目录移动等重 I/O 在全局锁之外、串行 GC 工作线程中完成；移动到
+  “提交元数据总表”之间，并发的键值/区间读取会透明地读取 `gcgrave-*` 暂存区里字节
+  完全相同的副本，因此大规模清退期间写入、读取、快照建立都即时响应。
+- **三阶段发布与崩溃对账**：
+
+  1. **目录换位** `seg-… → segments/gcgrave-<job>/<seg>/`（rename + 目录 fsync）；
+  2. **元数据总表发布**：manifest 原子提交，入选段标记 `status="evicted"`（墓碑）；
+  3. **audit 追加**：每个成功项写入持久 `state/gc_audit.json`，随后删除暂存目录。
+
+  进程在这三步之间退出，下次启动按持久意图（`gc_plans.json`/`gc_jobs.json`/
+  manifest/audit）对账：发布未落盘则**复原旧布局**并重放该作业；发布已落盘则
+  **接续同一 `gc_job`** 补完 audit 并清理暂存目录——不存在“半套生效”，也不留孤儿目录。
+- **清退后读取语义**：访问已清理 offset 区间返回 **HTTP 410** 并携带准确的
+  `cursor`（该区间之后第一个存活 offset，用于续读）；其余位置的值、设备排序键、
+  快照边界均保持原值，新写入照常落在空洞之后。审计可经 `GET /v1/gc/audit` 查询。
+
+```bash
+# 预演（不落盘）
+curl -XPOST localhost:8080/v1/gc/plans -d '{"cut":100000}'
+# 受理后台清退
+curl -XPOST localhost:8080/v1/gc/plans/gcp-…/apply          # -> 202 + gc_job
+curl localhost:8080/v1/gc/jobs/gcj-…                         # -> 进度
+curl localhost:8080/v1/gc/audit                              # -> 成功项
+# 读者保护
+curl -XPOST localhost:8080/v1/holds -d '{"hold_id":"r1","pos":50000,"ttl_seconds":600}'
+curl -XDELETE localhost:8080/v1/holds/r1
+# 读到已清退位置 -> 410 {"error":…,"cursor":<续读offset>}
+curl 'localhost:8080/v1/replay?from_offset=12&limit=100'
+```
+
 ## 持久化与故障语义
 
 ```
@@ -165,8 +224,13 @@ $data_dir/
   state/manifest.json              # 段目录 + 封存水位（原子替换落盘）
   state/freezes.json               # 冻结视界
   state/repairs.json               # 后台修复作业日志（崩溃恢复/去重依据）
+  state/holds.json                 # 读者保护区（创建/续期/解除）
+  state/gc_plans.json              # 已受理/已拒绝的清退单（含 stamp 与保护快照）
+  state/gc_jobs.json               # 清退作业日志（崩溃对账/幂等依据）
+  state/gc_audit.json              # 成功清退项的持久审计
   segments/stage-<job>-<n>/<seg>/  # 修复候选（提交前不触碰 live）
   segments/bak-<job>-<n>/<seg>/    # 原子交换期间的旧段（提交后删除）
+  segments/gcgrave-<job>/<seg>/    # 清退目录换位后的暂存区（发布后、audit 后删除）
 ```
 
 - **确认即持久**：每批写入先 WAL 追加 + `fsync`，再更新内存态并 ACK；
@@ -193,6 +257,10 @@ $data_dir/
 | `EA_REPAIR_MAX_ATTEMPTS` | `5` | 单个修复遇版本冲突/瞬时 I/O 的最大尝试次数 |
 | `EA_REPAIR_RETRY_BACKOFF_SEC` | `0.1` | 重试退避基数（×尝试次数） |
 | `EA_REPAIR_HISTORY` | `100` | 作业日志保留的终态作业条数（活动作业不裁剪） |
+| `EA_GC_WORKERS` | `1` | 清退作业并发线程数（默认串行，重 I/O 均在全局锁外） |
+| `EA_GC_HOLD_DEFAULT_TTL_SEC` | `900` | 保护区未显式给 `ttl_seconds` 时的默认有效期 |
+| `EA_GC_HOLD_MAX_TTL_SEC` | `86400` | 单次保护区 TTL 上限（秒） |
+| `EA_GC_AUDIT_HISTORY` | `1000` | 审计保留的成功清退项条数 |
 
 ## 设计取舍与限制
 

@@ -62,6 +62,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._route(method, parts, q)
         except storemod.NotFound as exc:
             self._error(404, str(exc))
+        except storemod.PlanConflict as exc:
+            self._error(409, str(exc), changed=exc.changed)
+        except storemod.Gone as exc:
+            self._error(410, str(exc), cursor=exc.cursor)
         except storemod.Quarantined as exc:
             self._error(410, str(exc), segment=exc.seg_id,
                         resume_offset=exc.resume_offset)
@@ -85,6 +89,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._dispatch("POST")
+
+    def do_DELETE(self):
+        self._dispatch("DELETE")
 
     def _route(self, method, parts, q):
         s = self.store
@@ -166,5 +173,66 @@ class Handler(BaseHTTPRequestHandler):
                 device_id=q.get("device_id"),
                 limit=_clamp_limit(q.get("limit"), 500, 5000),
             ))
+
+        # ---- capacity eviction: previews, holds, jobs, audit ----------- #
+
+        if method == "POST" and parts == ["v1", "gc", "plans"]:
+            # Pure preview: only plan_id/stamp/items/size (+cut metadata) are
+            # returned; no archive file or manifest is modified.
+            body = self._body_json()
+            if not isinstance(body, dict) or "cut" not in body:
+                raise ValueError("body must contain an integer 'cut'")
+            return self._send_json(s.create_plan(int(body["cut"])))
+
+        if method == "POST" and len(parts) == 5 and parts[:2] == ["v1", "gc"] \
+                and parts[2] == "plans" and parts[4] == "apply":
+            # First acceptance -> 202 + gc_job; repeat of the same plan ->
+            # 200 + the same job id.  A drifted order -> 409 (disk untouched).
+            job, status = s.apply_plan(parts[3])
+            return self._send_json({"gc_job": job}, status=status)
+
+        if method == "GET" and len(parts) == 4 and parts[:2] == ["v1", "gc"] \
+                and parts[2] == "plans":
+            return self._send_json(s.get_plan(parts[3]))
+
+        if method == "GET" and len(parts) == 4 and parts[:2] == ["v1", "gc"] \
+                and parts[2] == "jobs":
+            return self._send_json({"gc_job": s.get_gc_job(parts[3])})
+
+        if method == "POST" and len(parts) == 4 and parts[:2] == ["v1", "gc"] \
+                and parts[2] == "jobs":
+            body = self._body_json()
+            timeout = body.get("timeout", 60.0) if isinstance(body, dict) else 60.0
+            try:
+                timeout = float(timeout)
+            except (TypeError, ValueError):
+                timeout = 60.0
+            timeout = max(0.0, min(timeout, 3600.0))
+            return self._send_json({"gc_job": s.wait_gc_job(parts[3], timeout)})
+
+        if method == "GET" and parts == ["v1", "gc", "jobs"]:
+            return self._send_json(
+                {"jobs": s.list_gc_jobs(limit=_clamp_limit(q.get("limit"), 100, 1000))})
+
+        if method == "GET" and parts == ["v1", "gc", "audit"]:
+            return self._send_json(
+                {"audit": s.gc_audit(limit=_clamp_limit(q.get("limit"), 100, 10000))})
+
+        if method == "POST" and parts == ["v1", "holds"]:
+            body = self._body_json()
+            if not isinstance(body, dict) or "hold_id" not in body \
+                    or "pos" not in body:
+                raise ValueError("body must contain hold_id, pos, ttl_seconds")
+            hold, created = s.put_hold(
+                body["hold_id"], int(body["pos"]),
+                float(body["ttl_seconds"]) if body.get("ttl_seconds") is not None
+                else None)
+            return self._send_json({"hold": hold}, status=201 if created else 200)
+
+        if method == "GET" and parts == ["v1", "holds"]:
+            return self._send_json({"holds": s.list_holds()})
+
+        if method == "DELETE" and len(parts) == 3 and parts[:2] == ["v1", "holds"]:
+            return self._send_json({"hold": s.release_hold(parts[2])})
 
         return self._error(404, "not found")
