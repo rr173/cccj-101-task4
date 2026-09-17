@@ -85,7 +85,13 @@ make smoke    # 端到端：起服务→分类→冻结→重启→损坏→隔�
 | `POST /v1/freeze` | 冻结当前视图：封存开放段，返回 `{id, end_offset, segments}` |
 | `GET /v1/freezes` | 冻结列表 |
 | `GET /v1/replay?freeze_id=&from_offset=&device_id=&limit=` | 回放冻结视图（不传 `freeze_id` 则回放到当前头） |
-| `GET /v1/stats` · `GET /v1/healthz` | 运行指标 / 健康检查 |
+| `POST /v1/gc/plans` | 容量清退**预演**：body `{"cut": <offset>}`，只计算并返回固定的 `plan_id/stamp/items/size`，不落任何盘 |
+| `POST /v1/gc/plans/{id}/apply` | 受理预演：首次 `202 {"gc_job"}`，重复 `200` 同一 id；预演后任一前提变化整单 `409` 且磁盘原样 |
+| `GET /v1/gc/jobs/{id}` · `GET /v1/gc/jobs` | 清退作业进度（`status/stage/completed/total/size_freed/items`）/ 作业列表 |
+| `GET /v1/gc/audit?limit=` | 成功清退项的持久审计（JSONL 追加，每条目一行 fsync） |
+| `POST /v1/holds` | 创建/幂等续期读者保护区：`{hold_id, pos, ttl_seconds}`，保护 `pos` 所在项及更大位置 |
+| `GET /v1/holds` · `DELETE /v1/holds/{id}` | 保护区列表 / 主动解除 |
+| `GET /v1/stats` · `GET /v1/healthz` | 运行指标（含 `gc` 段）/ 健康检查 |
 
 ### 冻结与回放
 
@@ -153,6 +159,80 @@ succeeded | failed`，每次状态迁移落盘到 `state/repairs.json`。失败�
   `succeeded` 但崩溃在“换目录与 manifest 提交之间”的作业会在候选字节校验
   通过时补提交、否则回滚，保证已确认数据不丢、段不重。
 
+## 容量清退（GC）预演与读者保护
+
+容量回收分两步：**只读预演**与**后台执行**，二者严格隔离——预演绝不修改任何
+字节（连状态文件都不写），真正的删除意图只在 apply 受理时落盘。
+
+### 预演：`POST /v1/gc/plans`
+
+```bash
+curl -XPOST localhost:8080/v1/gc/plans -d '{"cut": 100000}'
+# {
+#   "plan_id": "gcp-…",          # 固定，仅存在于本进程内存
+#   "stamp":  "…",               # 整单指纹（cut + 每项 stamp/size）
+#   "items":  [{"id","first_offset","last_offset","count","stamp","size"}],
+#   "size":   4966
+# }
+```
+
+- `cut` 是 offset 水位：完全位于水位**之下**（`last_offset < cut`）的已封存、
+  健康段才可能入选。
+- 每个候选项的 `stamp` 覆盖其身份/版本/meta sha、**events.log 实际字节哈希**与
+  字节大小；预演后任何一项的字节、引用关系、维修态、保护集合或 cut 选择发生变化，
+  apply 都会让**整单**返回 `409`（冲突原因逐条给出），磁盘维持原样。
+- 入选自动避开三类对象：
+  - **快照引用集合**：被任一 freeze 的 `segments` 引用的段；
+  - **正在维修集合**：登记在活动修复作业中的段（含隔离段）；
+  - **尚未过期的保护区（hold）**：见下。
+- 同一 plan 反复 apply 返回**相同结论**：首次 `202 {"gc_job"}`，之后恒为 `200`
+  + 同一个 `gc_job` id；已冲突的 plan 再次 apply 仍冲突（结论粘性）。
+
+### 读者保护：`POST /v1/holds` / `DELETE /v1/holds/{id}`
+
+```bash
+# pos 定位到所在段；该段以及所有 first_offset 更大的段都被保护
+curl -XPOST localhost:8080/v1/holds -d '{"hold_id":"reader-a","pos":6,"ttl_seconds":300}'
+# 同一 hold_id 再发即幂等续期（新 pos/ttl 生效），只影响“之后创建”的 plan
+curl -XDELETE localhost:8080/v1/holds/reader-a
+```
+
+- hold 持久化（`state/holds.json`），按 wall-clock 过期；过期即视同不存在。
+- `pos` 落在开放尾/已清退区间之外时，边界取 `pos` 自身（保护未来更大位置）。
+
+### 后台执行与三阶段发布
+
+`apply` 受理后只入队一个 `gc_job`（`GET /v1/gc/jobs/{id}` 轮询
+`queued→running→succeeded` 与 `completed/total`），重 I/O 全部在有界后台工作池中、
+**在全局锁之外**完成；前台写流量、键值读取、快照建立、历史读取都不被拖慢。
+读到正在换位的极短窗口会立即得到可重试的 `503`（而非阻塞），换位完成后再读则是
+永久的 `410`。
+
+每个入选项按三个崩溃安全阶段发布，进程在任意两阶段之间退出，下次启动都依据持久意图
+（`state/gc.json`）对账——**要么复原旧布局，要么接续同一个 gc_job**，不存在半套生效：
+
+1. **目录换位**：live 段目录原子 rename 到 `segments/gcgrave-<job>/<seg>/`；
+2. **元数据总表发布**：从 manifest 移除该段、写入 evicted 墓碑（tombstone），原子提交；
+3. **audit 追加**：向 `state/gc_audit.log` 追加一行 fsync 的 JSONL，随后删除墓场。
+
+### 清理后的读语义与 410 续读位置
+
+- 清退段以墓碑（offset 区间 + 紧凑设备索引）留在 manifest 中：**offset、排序键
+  （设备业务序）、快照边界全部保持原值**，`next_offset`、`sealed_through` 不变。
+- 访问已清理位置 → **HTTP 410**，携带准确 `cursor`：越过“连续已清退游程”之后的
+  下一个存活 offset。例如 `[0..4]`、`[5..9]` 两段都清退后，从 `from_offset=0`
+  读得到 `cursor=10`；用该 cursor 续读即从存活尾部继续。
+- 设备业务序查询把相邻清退游程合并成一个 `gaps[]`（`reason="evicted"` +
+  `resume_offset`）；其余位置按原业务序返回。
+- 清退后新写照常（落在更高 offset）；清退前建立、仅引用存活段的快照历史读取不受影响。
+
+```
+state/gc.json        # gc_job 持久意图日志（崩溃对账/幂等去重依据）
+state/gc_audit.log   # 每条成功清退一行 JSONL（fsync 追加），GET /v1/gc/audit
+state/holds.json     # 读者保护区（含过期时刻）
+segments/gcgrave-<job>/<seg>/   # 目录换位后、audit 前的临时墓场
+```
+
 ## 持久化与故障语义
 
 ```
@@ -162,11 +242,15 @@ $data_dir/
     events.log                     # 不可变记录（同 WAL 帧格式）
     index.json                     # 设备 → (seq, offset, event_id, pos, len)
     meta.json                      # offset 区间、计数、sha256、时间窗
-  state/manifest.json              # 段目录 + 封存水位（原子替换落盘）
+  state/manifest.json              # 段目录 + 封存水位 + evicted 墓碑（原子替换落盘）
   state/freezes.json               # 冻结视界
   state/repairs.json               # 后台修复作业日志（崩溃恢复/去重依据）
+  state/gc.json                    # 清退作业持久意图日志（三阶段崩溃对账/幂等依据）
+  state/gc_audit.log              # 成功清退项的 JSONL 追加审计（每行 fsync）
+  state/holds.json                 # 读者保护区（hold_id/pos/边界/过期时刻）
   segments/stage-<job>-<n>/<seg>/  # 修复候选（提交前不触碰 live）
   segments/bak-<job>-<n>/<seg>/    # 原子交换期间的旧段（提交后删除）
+  segments/gcgrave-<job>/<seg>/    # GC 目录换位后、audit 前的临时墓场
 ```
 
 - **确认即持久**：每批写入先 WAL 追加 + `fsync`，再更新内存态并 ACK；
@@ -193,6 +277,8 @@ $data_dir/
 | `EA_REPAIR_MAX_ATTEMPTS` | `5` | 单个修复遇版本冲突/瞬时 I/O 的最大尝试次数 |
 | `EA_REPAIR_RETRY_BACKOFF_SEC` | `0.1` | 重试退避基数（×尝试次数） |
 | `EA_REPAIR_HISTORY` | `100` | 作业日志保留的终态作业条数（活动作业不裁剪） |
+| `EA_GC_WORKERS` | `1` | 后台清退作业并发工作线程数 |
+| `EA_GC_HISTORY` | `100` | 清退作业日志保留的终态作业条数（活动作业不裁剪） |
 
 ## 设计取舍与限制
 

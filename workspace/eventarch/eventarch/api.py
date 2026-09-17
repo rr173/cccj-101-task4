@@ -7,6 +7,7 @@ import logging
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 
+from . import gc as gcmod
 from . import store as storemod
 
 log = logging.getLogger("eventarch.api")
@@ -65,6 +66,17 @@ class Handler(BaseHTTPRequestHandler):
         except storemod.Quarantined as exc:
             self._error(410, str(exc), segment=exc.seg_id,
                         resume_offset=exc.resume_offset)
+        except gcmod.Gone as exc:
+            body = {"error": str(exc), "cursor": exc.cursor,
+                    "first_offset": exc.first_offset,
+                    "last_offset": exc.last_offset}
+            if exc.seg_id is not None:
+                body["segment"] = exc.seg_id
+            self._send_json(body, status=410)
+        except gcmod.PlanConflict as exc:
+            self._error(409, str(exc), conflicts=exc.reasons)
+        except gcmod.ReadRetry as exc:
+            self._error(503, str(exc), segment=exc.seg_id, retry_after="0")
         except storemod.WalCoverageGone as exc:
             self._error(410, str(exc), segment=exc.seg_id,
                         resume_offset=exc.resume_offset)
@@ -85,6 +97,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._dispatch("POST")
+
+    def do_DELETE(self):
+        self._dispatch("DELETE")
 
     def _route(self, method, parts, q):
         s = self.store
@@ -166,5 +181,43 @@ class Handler(BaseHTTPRequestHandler):
                 device_id=q.get("device_id"),
                 limit=_clamp_limit(q.get("limit"), 500, 5000),
             ))
+
+        # -- capacity reclamation (gc) and reader protection ------------- #
+
+        if method == "POST" and parts == ["v1", "gc", "plans"]:
+            body = self._body_json()
+            if not isinstance(body, dict) or "cut" not in body:
+                raise ValueError("body must contain an integer 'cut'")
+            return self._send_json(s.gc.create_plan(body["cut"]))
+
+        if method == "POST" and len(parts) == 5 and parts[:3] == ["v1", "gc", "plans"] \
+                and parts[4] == "apply":
+            job, accepted = s.gc.apply_plan(parts[3])
+            return self._send_json({"gc_job": job}, status=202 if accepted else 200)
+
+        if method == "GET" and len(parts) == 4 and parts[:3] == ["v1", "gc", "jobs"]:
+            return self._send_json({"gc_job": s.gc.get_job(parts[3])})
+
+        if method == "GET" and parts == ["v1", "gc", "jobs"]:
+            limit = _clamp_limit(q.get("limit"), 100, 1000)
+            return self._send_json({"gc_jobs": s.gc.list_jobs(limit=limit)})
+
+        if method == "GET" and parts == ["v1", "gc", "audit"]:
+            limit = _clamp_limit(q.get("limit"), 100, 10000)
+            return self._send_json(s.gc.list_audit(limit=limit))
+
+        if method == "POST" and parts == ["v1", "holds"]:
+            body = self._body_json()
+            for key in ("hold_id", "pos", "ttl_seconds"):
+                if not isinstance(body, dict) or key not in body:
+                    raise ValueError(f"body must contain '{key}'")
+            return self._send_json(s.gc.create_hold(
+                body["hold_id"], body["pos"], body["ttl_seconds"]))
+
+        if method == "GET" and parts == ["v1", "holds"]:
+            return self._send_json({"holds": s.gc.list_holds()})
+
+        if method == "DELETE" and len(parts) == 3 and parts[:2] == ["v1", "holds"]:
+            return self._send_json(s.gc.release_hold(parts[2]))
 
         return self._error(404, "not found")

@@ -21,6 +21,8 @@ class Config:
     repair_max_attempts: int = 5          # version-conflict / torn-WAL retries
     repair_retry_backoff_sec: float = 0.1
     repair_history: int = 100             # finished jobs retained in the journal
+    gc_workers: int = 1                   # background eviction-job concurrency
+    gc_history: int = 100                 # finished gc jobs retained in the journal
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -45,4 +47,6 @@ class Config:
             repair_retry_backoff_sec=env("EA_REPAIR_RETRY_BACKOFF_SEC",
                                          cls.repair_retry_backoff_sec, float),
             repair_history=env("EA_REPAIR_HISTORY", cls.repair_history, int),
+            gc_workers=env("EA_GC_WORKERS", cls.gc_workers, int),
+            gc_history=env("EA_GC_HISTORY", cls.gc_history, int),
         )

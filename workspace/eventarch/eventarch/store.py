@@ -29,6 +29,7 @@ import uuid
 from queue import Queue
 from typing import Dict, List, Optional, Tuple
 
+from . import gc as gcmod
 from . import segments as segmod
 from . import wal as walmod
 from .models import fmt_ts, new_flags, parse_ts, utcnow, validate_event
@@ -124,10 +125,15 @@ class ArchiveStore:
         self._freezes_path = os.path.join(self.state_dir, "freezes.json")
         self._repairs_path = os.path.join(self.state_dir, "repairs.json")
 
+        # Capacity reclamation (GC plans/jobs/audit) and reader holds live
+        # in their own manager; its durable state is reconciled in open().
+        self.gc = gcmod.GCManager(self)
+
         self._lock = threading.RLock()
         # Notified on every repair-job terminal transition (used by wait_repair).
         self._repair_cv = threading.Condition()
-        self.manifest = {"next_offset": 0, "sealed_through": -1, "segments": []}
+        self.manifest = {"next_offset": 0, "sealed_through": -1,
+                         "segments": [], "evicted": []}
         self._seg_by_id: Dict[str, dict] = {}
         self._devices: Dict[str, DeviceState] = {}
         self._open_records: List[dict] = []
@@ -169,10 +175,16 @@ class ArchiveStore:
 
         if os.path.exists(self._manifest_path):
             self.manifest = load_json(self._manifest_path)
+        self.manifest.setdefault("evicted", [])
         self._seg_by_id = {m["id"]: m for m in self.manifest["segments"]}
         sealed_through = self.manifest.get("sealed_through", -1)
         for meta in self.manifest["segments"]:
             meta.setdefault("version", 1)
+
+        # 0a. reconcile interrupted GC evictions (directory swap / manifest
+        #     publish / audit append windows) BEFORE verification and before
+        #     the generic orphan sweep, exactly like repair reconciliation.
+        self.gc.recover()
 
         # 0. finish or roll back any interrupted background repair (crash
         #    between staging, directory swap and manifest commit), load the
@@ -217,8 +229,9 @@ class ArchiveStore:
                     changed = True
 
         # 2. drop orphan directories: segments never committed to the
-        #    manifest, and leftover repair staging/backup directories whose
-        #    job was not journaled (or whose state is already resolved).
+        #    manifest, leftover repair staging/backup directories whose
+        #    job was not journaled (or whose state is already resolved),
+        #    and GC graveyards left without a journaled eviction intent.
         for name in os.listdir(self.seg_root):
             full = os.path.join(self.seg_root, name)
             if not os.path.isdir(full):
@@ -228,6 +241,9 @@ class ArchiveStore:
                 shutil.rmtree(full, ignore_errors=True)
             elif name.startswith(("stage-", "bak-")):
                 log.warning("removing stale repair dir %s", name)
+                shutil.rmtree(full, ignore_errors=True)
+            elif name.startswith(gcmod.GRAVE_PREFIX):
+                log.warning("removing stale gc grave %s", name)
                 shutil.rmtree(full, ignore_errors=True)
         fsync_dir(self.seg_root)
 
@@ -245,6 +261,10 @@ class ArchiveStore:
                 self._apply_segment_index(meta["id"], idx)
         for rec in live:
             self._apply(rec)
+        # Evicted segments contribute marker entries (from manifest
+        # tombstones) so business-order reads keep reporting the gaps and
+        # resume cursors after a restart.
+        self.gc.attach_evicted_indexes()
 
         self._next_offset = max(
             sealed_through + 1,
@@ -276,6 +296,7 @@ class ArchiveStore:
                     self._active_repairs[job["seg_id"]] = jid
                     self._repair_q.put(jid)
         self._start_repair_workers()
+        self.gc.start()
 
         log.info(
             "recovery complete: %d segments (%d quarantined), %d live WAL records, "
@@ -516,13 +537,21 @@ class ArchiveStore:
         new data lands in fresh segments and can never leak into this view.
         """
         with self._lock:
+            # A segment accepted for eviction (swap in flight) must never be
+            # pinned by a snapshot mid-publish.  Snapshot the live segment
+            # ids BEFORE sealing the open buffer, then let the freshly sealed
+            # segment join the view (it cannot be gc-pending).
+            pending = self.gc.pending_ids()
+            live_ids = [m["id"] for m in self.manifest["segments"]
+                        if m["id"] not in pending]
             self._seal_open()
             frz = {
                 "id": f"frz-{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}-{uuid.uuid4().hex[:8]}",
                 "note": note,
                 "created_at": fmt_ts(utcnow()),
                 "end_offset": self._next_offset,  # exclusive horizon
-                "segments": [m["id"] for m in self.manifest["segments"]],
+                "segments": [m["id"] for m in self.manifest["segments"]
+                             if m["id"] not in pending],
             }
             self._freezes.append(frz)
             self._persist_freezes()
@@ -546,14 +575,27 @@ class ArchiveStore:
                 frz = next((f for f in self._freezes if f["id"] == freeze_id), None)
                 if frz is None:
                     raise NotFound(f"freeze {freeze_id} not found")
-                metas = [dict(self._seg_by_id[s]) for s in frz["segments"]
-                         if s in self._seg_by_id]
+                live_metas = [dict(self._seg_by_id[s]) for s in frz["segments"]
+                              if s in self._seg_by_id]
+                # Segments referenced by this snapshot but since evicted
+                # must surface as a 410 resume position, never silently vanish.
+                tombs = [dict(t) for t in self.gc.tombstones
+                         if t["id"] in set(frz["segments"])]
                 end_offset = frz["end_offset"]
                 open_snapshot: List[dict] = []
             else:
-                metas = [dict(m) for m in self.manifest["segments"]]
+                live_metas = [dict(m) for m in self.manifest["segments"]]
+                tombs = [dict(t) for t in self.gc.tombstones]
                 end_offset = self._next_offset
                 open_snapshot = list(self._open_records)
+
+        # Unified offset-ordered sequence of live segments and evicted
+        # tombstones; crossing an evicted range raises Gone with the exact
+        # cursor to continue after the contiguous evicted run.
+        units = (
+            [("tomb", t, t["first_offset"]) for t in tombs]
+            + [("seg", m, m["first_offset"]) for m in live_metas])
+        units.sort(key=lambda u: u[2])
 
         events: List[dict] = []
         gaps: List[dict] = []
@@ -566,9 +608,15 @@ class ArchiveStore:
                 return len(events) >= limit
             return False
 
-        for meta in metas:
-            if meta["last_offset"] < from_offset:
+        for kind, unit, _first in units:
+            if unit["last_offset"] < from_offset:
                 continue
+            if kind == "tomb":
+                cursor = self.gc.cursor_after(max(from_offset,
+                                                  unit["first_offset"]))
+                raise gcmod.Gone(cursor, unit["first_offset"],
+                                 unit["last_offset"], seg_id=unit["id"])
+            meta = unit
             if meta["status"] == "quarantined":
                 gaps.append({
                     "segment": meta["id"],
@@ -586,6 +634,18 @@ class ArchiveStore:
                              "resume_offset": c.resume_offset})
                 scanned_through = max(scanned_through, meta["last_offset"])
                 continue
+            except FileNotFoundError:
+                # Eviction swapped the directory between the plan above and
+                # the read.  Published tombstone -> Gone(410); swap window
+                # (not yet published) -> transient retry.
+                tomb = self.gc.tombstone(meta["id"])
+                if tomb is not None:
+                    raise gcmod.Gone(
+                        self.gc.cursor_after(max(from_offset,
+                                                 tomb["first_offset"])),
+                        tomb["first_offset"], tomb["last_offset"],
+                        seg_id=tomb["id"])
+                raise gcmod.ReadRetry(meta["id"])
             for rec in recs:
                 if rec["offset"] >= end_offset:
                     continue  # frozen horizon safety net
@@ -645,10 +705,17 @@ class ArchiveStore:
             selected = dev.entries[idx: idx + limit]
             plan: List[tuple] = []
             gaps: List[dict] = []
+            evicted_runs: List[Tuple[int, int, int, str]] = []  # first,last,cursor,id
             gap_segs = set()
             for e in selected:
                 if e.seg_id == OPEN:
                     plan.append(("mem", self._open_records[e.pos]))
+                    continue
+                tomb = self.gc.tombstone(e.seg_id)
+                if tomb is not None:
+                    evicted_runs.append((
+                        tomb["first_offset"], tomb["last_offset"],
+                        self.gc.cursor_after(tomb["first_offset"]), e.seg_id))
                     continue
                 meta = self._seg_by_id[e.seg_id]
                 if meta["status"] == "quarantined":
@@ -662,6 +729,22 @@ class ArchiveStore:
                     continue
                 plan.append(("seg", e.seg_id, e.pos, e.length))
 
+            # Merge contiguous evicted offset runs into one gap entry, so a
+            # multi-segment cleanup reports a single accurate resume cursor.
+            for first, last, cursor, seg_id2 in sorted(set(evicted_runs)):
+                if gaps and gaps[-1].get("reason") == "evicted" \
+                        and gaps[-1]["last_offset"] + 1 == first:
+                    gaps[-1]["last_offset"] = last
+                    gaps[-1]["resume_offset"] = cursor
+                else:
+                    gaps.append({
+                        "segment": seg_id2,
+                        "reason": "evicted",
+                        "resume_offset": cursor,
+                        "first_offset": first,
+                        "last_offset": last,
+                    })
+
         # I/O outside the lock; segment files are immutable once sealed.
         events: List[dict] = []
         handles = {}
@@ -672,12 +755,30 @@ class ArchiveStore:
                     continue
                 _, seg_id, pos, length = item
                 fh = handles.get(seg_id)
-                if fh is None:
-                    fh = open(segmod.events_path(self.seg_root, seg_id), "rb")
-                    handles[seg_id] = fh
                 try:
+                    if fh is None:
+                        fh = open(segmod.events_path(self.seg_root, seg_id), "rb")
+                        handles[seg_id] = fh
                     events.append(segmod.read_record_at(
                         self.seg_root, seg_id, pos, length, fh=fh))
+                except FileNotFoundError:
+                    # Directory swapped by an eviction between plan and read.
+                    tomb = self.gc.tombstone(seg_id)
+                    if tomb is not None and not any(
+                            g.get("segment") == seg_id for g in gaps):
+                        gaps.append({"segment": seg_id, "reason": "evicted",
+                                     "resume_offset":
+                                         self.gc.cursor_after(tomb["first_offset"]),
+                                     "first_offset": tomb["first_offset"],
+                                     "last_offset": tomb["last_offset"]})
+                    # no tomb yet -> transient swap window; skip this item,
+                    # the caller may retry the page.
+                    handles.pop(seg_id, None)
+                    if fh is not None:
+                        try:
+                            fh.close()
+                        except OSError:
+                            pass
                 except segmod.SegmentCorrupt as c:
                     meta = self._seg_by_id.get(seg_id)
                     resume = (meta["last_offset"] + 1) if meta else 0
@@ -699,6 +800,7 @@ class ArchiveStore:
         with self._lock:
             return {
                 "segments": [dict(m) for m in self.manifest["segments"]],
+                "evicted": [dict(t) for t in self.gc.tombstones],
                 "open": self._open_info(),
                 "sealed_through": self.manifest["sealed_through"],
                 "next_offset": self._next_offset,
@@ -709,6 +811,12 @@ class ArchiveStore:
         with self._lock:
             meta = self._seg_by_id.get(seg_id)
             if meta is None:
+                tomb = self.gc.tombstone(seg_id)
+                if tomb is not None:
+                    cursor = self.gc.cursor_after(
+                        max(from_offset, tomb["first_offset"]))
+                    raise gcmod.Gone(cursor, tomb["first_offset"],
+                                     tomb["last_offset"], seg_id=seg_id)
                 raise NotFound(f"segment {seg_id} not found")
             meta = dict(meta)
         if meta["status"] == "quarantined":
@@ -719,6 +827,14 @@ class ArchiveStore:
         except segmod.SegmentCorrupt as c:
             self.quarantine(seg_id, c.reason, expected_sha=meta.get("sha256"))
             raise Quarantined(seg_id, c.resume_offset, c.reason)
+        except FileNotFoundError:
+            with self._lock:
+                tomb = self.gc.tombstone(seg_id)
+            if tomb is not None:
+                raise gcmod.Gone(
+                    self.gc.cursor_after(max(from_offset, tomb["first_offset"])),
+                    tomb["first_offset"], tomb["last_offset"], seg_id=seg_id)
+            raise gcmod.ReadRetry(seg_id)
         return {"segment": meta, "events": recs, "complete": complete}
 
     # ------------------------------------------------------------------ #
@@ -738,6 +854,11 @@ class ArchiveStore:
         with self._lock:
             meta = self._seg_by_id.get(seg_id)
             if meta is None:
+                return False
+            if self.gc.is_pending(seg_id):
+                # Accepted for eviction: a concurrent read failure must not
+                # repaint the segment state that the GC is about to publish.
+                log.info("not quarantining %s: gc eviction in flight", seg_id)
                 return False
             if meta["status"] == "quarantined":
                 return True
@@ -815,6 +936,9 @@ class ArchiveStore:
             meta = self._seg_by_id.get(seg_id)
             if meta is None:
                 raise NotFound(f"segment {seg_id} not found")
+            if self.gc.is_pending(seg_id):
+                raise gcmod.PlanConflict(
+                    [f"{seg_id}: gc eviction already accepted"])
             existing_id = self._active_repairs.get(seg_id)
             if existing_id is not None:
                 return self._job_view(self._repairs[existing_id]), False
@@ -1464,6 +1588,7 @@ class ArchiveStore:
                     "gaps": list(self._wal_gaps),
                 },
                 "freezes": len(self._freezes),
+                "gc": self.gc._stats_locked(),
                 "repairs": {
                     "active": len(self._active_repairs),
                     "queued": sum(1 for j in self._repairs.values()
@@ -1515,6 +1640,7 @@ class ArchiveStore:
         # are requeued at the next startup.
         with self._lock:
             self._closing = True
+        self.gc.close()
         for _ in self._repair_workers:
             self._repair_q.put(None)
         for t in self._repair_workers:
